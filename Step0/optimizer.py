@@ -187,12 +187,13 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
                   contamination_times=None,
                   pickup_closure_config=None,
                   feasible_ref=None,
-                  stage_safe_masks=None):
+                  stage_safe_masks=None,
+                  congestion_data=None):
     """
     返回 evaluate(ind) → (time_obj, risk_obj)
 
-    时间目标 (含 sink 边界):
-        T_total = max(walk_time + queue_wait + bus_transit)
+    时间目标 (含 sink 边界 + 拥挤延迟):
+        T_total = walk_time_weighted + congestion_delay + sink_extra_time
         bus_transit = 2 × distance(stop → assigned_shelter) / bus_speed
 
     风险目标:
@@ -210,6 +211,9 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
         feasible_ref          – (新 v5.4) 可行域引用, 用于重定向时查找替代上车点
         stage_safe_masks      – (新 v5.6) (n_bus, 4) bool ndarray, [j, si] True=安全
                                 4阶段安全约束: 分配到任一时刻不安全上车点的解→不可行
+        congestion_data       – (新 v5.7) 道路拥挤度数据 dict, None 时关闭拥挤建模
+                                由 data_loader.build_congestion_data() 构建
+                                含 edge_paths / edge_capacities / edge_lengths
     """
     n = len(res_x)
     t_lim_min = int(max_time / 60)
@@ -247,6 +251,19 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
             shelter_mapping_multi=shelter_mapping_multi,
             shelter_capacities=shelter_capacities,
         )
+
+    # ── 道路拥挤度参数 (v5.7) ──
+    use_congestion = (congestion_data is not None)
+    if use_congestion:
+        from config import ROAD_CONGESTION_CONFIG as _ccfg
+        _edge_paths_map = congestion_data['edge_paths']
+        _edge_caps = congestion_data['edge_capacities']
+        _edge_lens = congestion_data['edge_lengths']
+        _bpr_alpha = _ccfg['bpr_alpha']
+        _bpr_beta = _ccfg['bpr_beta']
+        _cong_weight = _ccfg['congestion_weight']
+        print(f"   🚦 Road congestion: ENABLED "
+              f"(BPR α={_bpr_alpha}, β={_bpr_beta}, weight={_cong_weight})")
 
     def evaluate(ind):
         # ── Phase 1: 步行阶段 (含动态上车点关闭与重定向) ──
@@ -322,6 +339,27 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
                     return (np.inf, np.inf)
 
         walk_time_weighted = sum(t * p for t, p in zip(times, pop_arr))
+
+        # ── Phase 1.5: 道路拥挤度惩罚 (v5.7) ──
+        # 统计各路段人流量，超过通行能力时施加 BPR 延迟
+        # 效果: 优化器自然将人群分散到不同上车点/路径，避免拥挤
+        if use_congestion:
+            edge_flow = {}
+            for i in range(n):
+                j_stop = infos[i][2]  # 实际上车点 (可能经过动态关闭重定向)
+                for ek in _edge_paths_map.get((i, j_stop), ()):
+                    edge_flow[ek] = edge_flow.get(ek, 0.0) + pop_arr[i]
+            congestion_delay = 0.0
+            for ek, flow in edge_flow.items():
+                cap = _edge_caps.get(ek, 1e18)
+                if cap > 0 and flow > cap:
+                    vc = flow / cap
+                    length = _edge_lens.get(ek, 0.0)
+                    free_t = length / speed
+                    # BPR: delay = t_free × α × (V/C)^β
+                    delay = free_t * _bpr_alpha * (vc ** _bpr_beta)
+                    congestion_delay += delay * flow  # 人口加权延迟
+            walk_time_weighted += _cong_weight * congestion_delay
 
         # ── Phase 2: 步行风险 (沿路径累积) ──
         walk_risk = 0.0

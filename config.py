@@ -56,6 +56,25 @@ QNSGA2_CONFIG = dict(
     classical_ratio       = 0.3,
 )
 
+# ======================== 道路拥挤度建模配置 (v5.7) ========================
+# 基于道路宽度计算行人通行能力，当人流密度超过容量时施加 BPR 延迟惩罚
+ROAD_CONGESTION_CONFIG = dict(
+    enabled              = True,
+    width_fields         = ["width", "WIDTH", "road_width", "ROADWIDTH",
+                            "lane_width", "carriageway_width", "LANEWIDTH"],
+    default_widths_m     = dict(
+        motorway=22.0, trunk=15.0, primary=12.0, secondary=10.0,
+        tertiary=7.0, residential=6.0, service=5.0, path=2.0,
+        track=3.0, footway=2.0, pedestrian=3.0, unclassified=6.0,
+    ),
+    default_width_m      = 7.0,
+    effective_width_ratio = 0.75,
+    ped_flow_rate_ppm     = 75.0,
+    bpr_alpha            = 0.15,
+    bpr_beta             = 4.0,
+    congestion_weight    = 1.0,
+)
+
 # ======================== 可视化参数 ========================
 VIZ_CONFIG = dict(
     figsize       = (14, 12),

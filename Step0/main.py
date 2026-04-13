@@ -32,7 +32,9 @@ from data_loader import (
     compute_stop_contamination_times,
     compute_4stage_safe_stops,
     rebuild_feasible_for_stage, compute_intermediate_positions,
+    build_congestion_data,
 )
+from config import ROAD_CONGESTION_CONFIG
 from optimizer import (
     setup_deap, make_evaluate, run_qnsga2,
     select_solution, compute_metrics,
@@ -116,7 +118,7 @@ def optimize_group_multistage(config, selection_method="min_risk",
     logger.log(f"Residents: {len(res_df)}  Bus stops: {len(bus_xy)}")
 
     # ---------- Step 2: 预计算路径 ----------
-    road_paths, snapped_res, snapped_bus, validity = precompute_paths(
+    road_paths, snapped_res, snapped_bus, validity, path_node_seqs = precompute_paths(
         res_df, bus_xy, G, active_idx, bus_list, kd, nids, ncoords)
 
     # ---------- Step 3: 初始可行域 ----------
@@ -189,11 +191,14 @@ def optimize_group_multistage(config, selection_method="min_risk",
         o2n[active_idx.index(i)] = ni
     new_paths = {(o2n[ol], j): pl
                  for (ol, j), pl in road_paths.items() if ol in o2n}
+    new_node_seqs_ms = {(o2n[ol], j): ns
+                        for (ol, j), ns in path_node_seqs.items() if ol in o2n}
 
     active_idx   = valid_ai
     feasible_full = valid_f
     snapped_res  = np.array(valid_sr)
     road_paths   = new_paths
+    path_node_seqs = new_node_seqs_ms
 
     if not active_idx:
         print(f"   ⚠️  No residents with feasible stops — skipping group (multistage)")
@@ -614,7 +619,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
     logger.log(f"Residents: {len(res_df)}  Bus stops: {len(bus_xy)}")
 
     # ---------- Step 2: 预计算路径 ----------
-    road_paths, snapped_res, snapped_bus, validity = precompute_paths(
+    road_paths, snapped_res, snapped_bus, validity, path_node_seqs = precompute_paths(
         res_df, bus_xy, G, active_idx, bus_list, kd, nids, ncoords)
 
     # ---------- Step 3: 可行域 ----------
@@ -709,11 +714,14 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
         o2n[active_idx.index(i)] = ni
     new_paths = {(o2n[ol], j): pl
                  for (ol, j), pl in road_paths.items() if ol in o2n}
+    new_node_seqs = {(o2n[ol], j): ns
+                     for (ol, j), ns in path_node_seqs.items() if ol in o2n}
 
     active_idx   = valid_ai
     feasible     = valid_f
     snapped_res  = np.array(valid_sr)
     road_paths   = new_paths
+    path_node_seqs = new_node_seqs
 
     if not active_idx:
         print(f"   ⚠️  No residents with feasible/safe stops — skipping group")
@@ -723,6 +731,16 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
 
     res_pop = res_df["pop"].values[active_idx]
     logger.log(f"Active residents: {len(active_idx)}")
+
+    # ---------- Step 4.3: 道路拥挤度数据构建 (v5.7) ----------
+    congestion_data = None
+    if ROAD_CONGESTION_CONFIG.get("enabled", False):
+        print(f"\n   🚦 Building road congestion data ...")
+        congestion_data = build_congestion_data(
+            path_node_seqs, G, speed, max_t)
+        logger.log(f"Congestion: {len(congestion_data['edge_capacities'])} edges, "
+                   f"BPR α={ROAD_CONGESTION_CONFIG['bpr_alpha']} "
+                   f"β={ROAD_CONGESTION_CONFIG['bpr_beta']}")
 
     # ---------- Step 4.5: 避难所多候选预分配 (v5.3 改进 1) ----------
     # 基于 4 准则评分生成 Top K 候选列表 + Dijkstra 真实路网距离
@@ -839,7 +857,8 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
             contamination_times=contamination_times,
             pickup_closure_config=PICKUP_CLOSURE_CONFIG if use_dynamic_closure else None,
             feasible_ref=feasible,
-            stage_safe_masks=stage_safe_masks)
+            stage_safe_masks=stage_safe_masks,
+            congestion_data=congestion_data)
 
     # 优化循环：加速模式使用 run_qnsga2_accel，标准模式内联循环（含可视化记录）
     if accelerate:

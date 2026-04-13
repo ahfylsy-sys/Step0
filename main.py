@@ -25,8 +25,9 @@ from config import (
 from data_loader import (
     load_resident_data, load_bus_stops, load_all_risk_data,
     load_road_network, precompute_paths, build_feasible,
-    build_group_configs,
+    build_group_configs, build_congestion_data,
 )
+from config import ROAD_CONGESTION_CONFIG
 from optimizer import (
     setup_deap, make_evaluate, run_qnsga2,
     select_solution, compute_metrics,
@@ -85,7 +86,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
     logger.log(f"Residents: {len(res_df)}  Bus stops: {len(bus_xy)}")
 
     # ---------- Step 2: 预计算路径 ----------
-    road_paths, snapped_res, snapped_bus, validity = precompute_paths(
+    road_paths, snapped_res, snapped_bus, validity, path_node_seqs = precompute_paths(
         res_df, bus_xy, G, active_idx, bus_list, kd, nids, ncoords)
 
     # ---------- Step 3: 可行域 ----------
@@ -110,17 +111,25 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
         o2n[active_idx.index(i)] = ni
     new_paths = {(o2n[ol], j): pl
                  for (ol, j), pl in road_paths.items() if ol in o2n}
+    new_node_seqs = {(o2n[ol], j): ns
+                     for (ol, j), ns in path_node_seqs.items() if ol in o2n}
 
     active_idx   = valid_ai
     feasible     = valid_f
     snapped_res  = np.array(valid_sr)
     road_paths   = new_paths
+    path_node_seqs = new_node_seqs
 
     if not active_idx:
         raise ValueError("No residents with feasible stops!")
 
     res_pop = res_df["pop"].values[active_idx]
     logger.log(f"Active residents: {len(active_idx)}")
+
+    # ---------- Step 4.3: 道路拥挤度数据构建 (v5.7) ----------
+    congestion_data = None
+    if ROAD_CONGESTION_CONFIG.get("enabled", False):
+        congestion_data = build_congestion_data(path_node_seqs, G, speed, max_t)
 
     # ---------- Step 5: 创建 Pareto 可视化器 ----------
     pv = ParetoVisualizer(out, name)
@@ -136,7 +145,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
             ev = make_evaluate(
                 snapped_res[:, 0], snapped_res[:, 1], res_pop,
                 snapped_bus, road_paths, risk_arrays, x_mins, y_maxs, speed, max_t,
-                use_sink=True)
+                use_sink=True, congestion_data=congestion_data)
         else:
             ev = make_evaluate_accel(
                 snapped_res[:, 0], snapped_res[:, 1], res_pop,
@@ -147,7 +156,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
         ev = make_evaluate(
             snapped_res[:, 0], snapped_res[:, 1], res_pop,
             snapped_bus, road_paths, risk_arrays, x_mins, y_maxs, speed, max_t,
-            use_sink=use_sink)
+            use_sink=use_sink, congestion_data=congestion_data)
 
     # 优化循环：加速模式使用 run_qnsga2_accel，标准模式内联循环（含可视化记录）
     if accelerate:

@@ -15,7 +15,7 @@ from shapely.geometry import LineString
 from config import (
     CENTER_UTM, GRID_RES, CRS_UTM,
     DATA_ROOT, BUS_FILE, AGE_GROUPS, GENDERS, GENDER_SHORT,
-    WALK_SPEEDS, OUTPUT_ROOT,
+    WALK_SPEEDS, OUTPUT_ROOT, ROAD_CONGESTION_CONFIG,
 )
 
 
@@ -102,6 +102,19 @@ def load_road_network(shp_path, crs=CRS_UTM, center=None, clip_radius=None):
     if roads.empty:
         raise ValueError("Road network contains no valid LineStrings after clipping.")
 
+    # ── 道路宽度识别 (拥挤度建模) ──
+    ccfg = ROAD_CONGESTION_CONFIG
+    width_field = None
+    if ccfg["enabled"]:
+        for field in ccfg["width_fields"]:
+            if field in roads.columns:
+                width_field = field
+                break
+        if width_field:
+            print(f"   📏 Road width: using field '{width_field}'")
+        else:
+            print(f"   📏 Road width: no field found, using default {ccfg['default_width_m']}m")
+
     G = nx.Graph()
     c2n, nc = {}, 0
 
@@ -116,12 +129,21 @@ def load_road_network(shp_path, crs=CRS_UTM, center=None, clip_radius=None):
 
     for _, row in roads.iterrows():
         cs = list(row.geometry.coords)
+        # 获取宽度
+        width = ccfg["default_width_m"]
+        if width_field is not None:
+            import pandas as _pd
+            val = row.get(width_field)
+            if _pd.notna(val) and float(val) > 0:
+                width = float(val)
+        eff_width = width * ccfg["effective_width_ratio"]
+        capacity_ppm = eff_width * ccfg["ped_flow_rate_ppm"]
         for i in range(len(cs) - 1):
             u = _node(*cs[i])
             v = _node(*cs[i + 1])
             d = np.hypot(cs[i + 1][0] - cs[i][0], cs[i + 1][1] - cs[i][1])
             if not G.has_edge(u, v):
-                G.add_edge(u, v, length=d)
+                G.add_edge(u, v, length=d, width=width, capacity_ppm=capacity_ppm)
 
     coords = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
     nids = np.array(list(G.nodes()))
@@ -173,6 +195,7 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
 
     # --- 构建路径 ---
     paths, validity = {}, {}
+    path_node_seqs = {}
     ok, fail = 0, 0
     for il in range(len(active_idx)):
         rn = int(rnids[il])
@@ -182,13 +205,16 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
             if rn == bn:
                 x, y = snapped_res[il]
                 paths[(il, j)] = LineString([(x, y), (x + 0.001, y + 0.001)])
+                path_node_seqs[(il, j)] = [rn]
                 validity[(il, j)] = True
                 ok += 1
                 continue
             if bn in pd_:
-                cs = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in pd_[bn]]
+                node_seq = pd_[bn]
+                cs = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in node_seq]
                 if len(cs) >= 2:
                     paths[(il, j)] = LineString(cs)
+                    path_node_seqs[(il, j)] = list(node_seq)
                     validity[(il, j)] = True
                     ok += 1
                     continue
@@ -197,7 +223,7 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
 
     total = len(active_idx) * len(bus_list)
     print(f"   Paths: {ok}/{total} valid ({ok/total*100:.1f}%), {fail} no path")
-    return paths, snapped_res, snapped_bus, validity
+    return paths, snapped_res, snapped_bus, validity, path_node_seqs
 
 
 # ============================================================
@@ -217,3 +243,36 @@ def build_feasible(road_paths, n_active, bus_list, max_time_sec, speed):
     no_opt = sum(1 for f in feasible if len(f) == 0)
     print(f"   Feasible: {n_active - no_opt}/{n_active} residents have reachable stops")
     return feasible, no_opt
+
+
+# ============================================================
+#  道路拥挤度数据构建 (v5.7)
+# ============================================================
+def build_congestion_data(path_node_seqs, G, speed, max_time_sec):
+    """从预计算路径节点序列构建拥挤度评估数据。"""
+    ccfg = ROAD_CONGESTION_CONFIG
+    evac_duration_min = max_time_sec / 60.0
+    edge_paths, edge_capacities, edge_lengths, edge_widths = {}, {}, {}, {}
+
+    for (il, j), node_seq in path_node_seqs.items():
+        edges = []
+        for k in range(len(node_seq) - 1):
+            u, v = node_seq[k], node_seq[k + 1]
+            edge_key = (min(u, v), max(u, v))
+            edges.append(edge_key)
+            if edge_key not in edge_capacities:
+                edata = G.edges[u, v] if G.has_edge(u, v) else (
+                    G.edges[v, u] if G.has_edge(v, u) else {})
+                length = edata.get('length', 0.0)
+                width = edata.get('width', ccfg['default_width_m'])
+                cap_ppm = edata.get('capacity_ppm',
+                                    width * ccfg['effective_width_ratio']
+                                    * ccfg['ped_flow_rate_ppm'])
+                edge_capacities[edge_key] = cap_ppm * evac_duration_min
+                edge_lengths[edge_key] = length
+                edge_widths[edge_key] = width
+        edge_paths[(il, j)] = edges
+
+    print(f"   🚦 Congestion data: {len(edge_capacities)} unique edges")
+    return dict(edge_paths=edge_paths, edge_capacities=edge_capacities,
+                edge_lengths=edge_lengths, edge_widths=edge_widths)

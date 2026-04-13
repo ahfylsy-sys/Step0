@@ -151,6 +151,57 @@ ROAD_HIERARCHY_CONFIG = dict(
     default_multiplier   = 1.10,     # 未匹配到等级时的默认乘数
 )
 
+# ======================== 道路拥挤度建模配置 (v5.7) ========================
+# 基于道路宽度计算行人通行能力，当人流密度超过容量时施加 BPR 延迟惩罚
+# 文献依据:
+#   - HCM 6th Edition (TRB 2016): 行人服务水平 A-F, 流率-密度关系
+#   - BPR (Bureau of Public Roads, 1964): 经典 volume-delay 函数
+#     t_actual = t_free × [1 + α × (V/C)^β]
+#   - Daamen & Hoogendoorn (2003): 行人流基本图 (fundamental diagram)
+#   - Asano et al. (2010): 大规模疏散行人流仿真
+ROAD_CONGESTION_CONFIG = dict(
+    enabled              = True,      # 是否启用拥挤度建模
+
+    # ─── 道路宽度字段识别 (按优先级尝试 Shapefile 属性名) ───
+    width_fields         = ["width", "WIDTH", "road_width", "ROADWIDTH",
+                            "lane_width", "carriageway_width", "LANEWIDTH"],
+
+    # ─── 按道路等级的默认宽度 (m) ───
+    # 当 Shapefile 无宽度字段时，按等级赋值
+    # 数据来源: 中国 CJJ 37-2012 城市道路设计规范 + OSM Wiki
+    default_widths_m     = dict(
+        motorway     = 22.0,   # 高速公路 (双向4车道+应急车道)
+        trunk        = 15.0,   # 快速路 (双向4车道)
+        primary      = 12.0,   # 主干道 (双向3车道)
+        secondary    = 10.0,   # 次干道 (双向2车道)
+        tertiary     = 7.0,    # 支路
+        residential  = 6.0,    # 居民区道路
+        service      = 5.0,    # 服务道路
+        path         = 2.0,    # 小路
+        track        = 3.0,    # 土路
+        footway      = 2.0,    # 人行道
+        pedestrian   = 3.0,    # 步行街
+        unclassified = 6.0,    # 未分类
+    ),
+    default_width_m      = 7.0,    # 完全无法匹配等级时的默认宽度
+
+    # ─── 行人通行能力参数 (HCM 6th Edition, Chapter 16) ───
+    effective_width_ratio = 0.75,  # 有效通行宽度比 (扣除路缘/障碍物/缓冲)
+    ped_flow_rate_ppm     = 75.0,  # 行人流率上限 (人/分钟/米有效宽度)
+                                    # HCM LOS E ≈ 75 p/min/m (容量极限)
+
+    # ─── BPR (Bureau of Public Roads) 延迟函数 ───
+    # 当路段人流量 V 超过通行能力 C 时:
+    #   t_actual = t_free × [1 + α × (V/C)^β]
+    # V/C=1.0 → 延迟 15%; V/C=1.5 → 延迟 76%; V/C=2.0 → 延迟 240%
+    bpr_alpha            = 0.15,   # BPR α (经典值, FHWA 推荐)
+    bpr_beta             = 4.0,    # BPR β (经典值, 惩罚随超载急剧增长)
+
+    # ─── 拥挤惩罚权重 ───
+    congestion_weight    = 1.0,    # 拥挤延迟对时间目标的贡献权重
+                                    # 1.0 = 与步行时间等权; <1 弱化拥挤影响
+)
+
 # ======================== 上车点动态关闭配置 ========================
 # 当风险场覆盖上车点时, 动态关闭该上车点并重定向居民
 PICKUP_CLOSURE_CONFIG = dict(

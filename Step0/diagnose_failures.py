@@ -71,7 +71,7 @@ for config in configs:
     bus_list = list(range(len(bus_xy)))
     
     # 预计算路径
-    road_paths, snapped_res, snapped_bus, validity = precompute_paths(
+    road_paths, snapped_res, snapped_bus, validity, _ = precompute_paths(
         res_df, bus_xy, G, active_idx, bus_list, kd, nids, ncoords)
     
     # 构建可行域
