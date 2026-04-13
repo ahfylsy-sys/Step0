@@ -16,6 +16,7 @@ from config import (
     CENTER_UTM, GRID_RES, CRS_UTM,
     DATA_ROOT, BUS_FILE, AGE_GROUPS, GENDERS, GENDER_SHORT,
     WALK_SPEEDS, OUTPUT_ROOT, ROAD_HIERARCHY_CONFIG,
+    ROAD_CONGESTION_CONFIG,
 )
 
 
@@ -167,6 +168,36 @@ def load_road_network(shp_path, crs=CRS_UTM, center=None, clip_radius=None):
                 return mult
         return hcfg["default_multiplier"]
 
+    # ── 道路宽度识别 (拥挤度建模) ──
+    ccfg = ROAD_CONGESTION_CONFIG
+    width_field = None
+    if ccfg["enabled"]:
+        for field in ccfg["width_fields"]:
+            if field in roads.columns:
+                width_field = field
+                break
+        if width_field:
+            print(f"   📏 Road width: using field '{width_field}'")
+        else:
+            print(f"   📏 Road width: no field found, using defaults by road class")
+
+    def _get_width(row):
+        """获取道路宽度 (m)：优先用 Shapefile 字段，否则按等级赋默认值"""
+        if width_field is not None:
+            import pandas as _pd
+            val = row.get(width_field)
+            if _pd.notna(val):
+                w = float(val)
+                if w > 0:
+                    return w
+        # 按道路等级赋默认宽度
+        if road_class_field is not None:
+            cv = str(row.get(road_class_field, "")).lower().strip()
+            for key, width in ccfg["default_widths_m"].items():
+                if cv.startswith(key):
+                    return width
+        return ccfg["default_width_m"]
+
     G = nx.Graph()
     c2n, nc = {}, 0
 
@@ -180,18 +211,26 @@ def load_road_network(shp_path, crs=CRS_UTM, center=None, clip_radius=None):
         return c2n[k]
 
     multiplier_stats = {"count": 0, "weighted_total": 0.0}
+    width_stats = {"total": 0.0, "count": 0}
     for _, row in roads.iterrows():
         cs = list(row.geometry.coords)
         # 获取该路段的等级乘数
         mult = _get_multiplier(row.get(road_class_field, "")) if road_class_field else 1.0
+        # 获取该路段的宽度和通行能力
+        width = _get_width(row) if ccfg["enabled"] else ccfg["default_width_m"]
+        eff_width = width * ccfg["effective_width_ratio"]
+        capacity_ppm = eff_width * ccfg["ped_flow_rate_ppm"]  # 人/分钟
         for i in range(len(cs) - 1):
             u = _node(*cs[i])
             v = _node(*cs[i + 1])
             d = np.hypot(cs[i + 1][0] - cs[i][0], cs[i + 1][1] - cs[i][1])
             if not G.has_edge(u, v):
-                G.add_edge(u, v, length=d, weight=d * mult)
+                G.add_edge(u, v, length=d, weight=d * mult,
+                           width=width, capacity_ppm=capacity_ppm)
                 multiplier_stats["count"] += 1
                 multiplier_stats["weighted_total"] += mult
+                width_stats["total"] += width
+                width_stats["count"] += 1
 
     coords = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
     nids = np.array(list(G.nodes()))
@@ -201,6 +240,12 @@ def load_road_network(shp_path, crs=CRS_UTM, center=None, clip_radius=None):
         avg_mult = multiplier_stats["weighted_total"] / multiplier_stats["count"]
         print(f"   🛣️  Road hierarchy: avg multiplier={avg_mult:.3f} "
               f"(1.0=tertiary baseline, <1.0=priority roads)")
+
+    # 诊断: 道路宽度分布
+    if ccfg["enabled"] and width_stats["count"] > 0:
+        avg_w = width_stats["total"] / width_stats["count"]
+        print(f"   📏 Road width: avg={avg_w:.1f}m across {width_stats['count']} edges"
+              f" (capacity={avg_w * ccfg['effective_width_ratio'] * ccfg['ped_flow_rate_ppm']:.0f} p/min)")
 
     print(f"✅ Road graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G, nids, coords, KDTree(coords)
@@ -252,6 +297,7 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
 
     # --- 构建路径 ---
     paths, validity = {}, {}
+    path_node_seqs = {}   # {(i_local, j): [node_id, ...]} 用于拥挤度建模
     ok, fail = 0, 0
     for il in range(len(active_idx)):
         rn = int(rnids[il])
@@ -261,13 +307,16 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
             if rn == bn:
                 x, y = snapped_res[il]
                 paths[(il, j)] = LineString([(x, y), (x + 0.001, y + 0.001)])
+                path_node_seqs[(il, j)] = [rn]
                 validity[(il, j)] = True
                 ok += 1
                 continue
             if bn in pd_:
-                cs = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in pd_[bn]]
+                node_seq = pd_[bn]
+                cs = [(G.nodes[n]["x"], G.nodes[n]["y"]) for n in node_seq]
                 if len(cs) >= 2:
                     paths[(il, j)] = LineString(cs)
+                    path_node_seqs[(il, j)] = list(node_seq)
                     validity[(il, j)] = True
                     ok += 1
                     continue
@@ -276,7 +325,7 @@ def precompute_paths(res_df, bus_xy, G, active_idx, bus_list,
 
     total = len(active_idx) * len(bus_list)
     print(f"   Paths: {ok}/{total} valid ({ok/total*100:.1f}%), {fail} no path")
-    return paths, snapped_res, snapped_bus, validity
+    return paths, snapped_res, snapped_bus, validity, path_node_seqs
 
 
 # ============================================================
@@ -296,6 +345,80 @@ def build_feasible(road_paths, n_active, bus_list, max_time_sec, speed):
     no_opt = sum(1 for f in feasible if len(f) == 0)
     print(f"   Feasible: {n_active - no_opt}/{n_active} residents have reachable stops")
     return feasible, no_opt
+
+
+# ============================================================
+#  道路拥挤度数据构建 (v5.7)
+# ============================================================
+def build_congestion_data(path_node_seqs, G, speed, max_time_sec):
+    """
+    从预计算的路径节点序列构建道路拥挤度评估所需的数据结构。
+
+    核心思想:
+        1. 每条路径经过若干道路段 (边)
+        2. 每条边有通行能力 (由宽度决定)
+        3. 当多条路径共享同一条边时，人流量叠加
+        4. 超过通行能力时，BPR 函数施加非线性延迟惩罚
+
+    参数:
+        path_node_seqs – {(i_local, j): [node_id, ...]} 路径节点序列
+        G              – NetworkX 路网图 (边属性含 length, width, capacity_ppm)
+        speed          – 步行速度 (m/s)
+        max_time_sec   – 最大步行时间 (秒)
+
+    返回:
+        congestion_data – dict:
+            'edge_paths':      {(i,j): [(u,v), ...]}   每条路径经过的边列表
+            'edge_capacities': {(u,v): float}           每条边的总吞吐能力 (人)
+            'edge_lengths':    {(u,v): float}            每条边的长度 (m)
+            'edge_widths':     {(u,v): float}            每条边的宽度 (m)
+    """
+    ccfg = ROAD_CONGESTION_CONFIG
+    evac_duration_min = max_time_sec / 60.0
+
+    edge_paths = {}
+    edge_capacities = {}
+    edge_lengths = {}
+    edge_widths = {}
+
+    for (il, j), node_seq in path_node_seqs.items():
+        edges = []
+        for k in range(len(node_seq) - 1):
+            u, v = node_seq[k], node_seq[k + 1]
+            edge_key = (min(u, v), max(u, v))  # 归一化无向边
+            edges.append(edge_key)
+            if edge_key not in edge_capacities:
+                if G.has_edge(u, v):
+                    edata = G.edges[u, v]
+                elif G.has_edge(v, u):
+                    edata = G.edges[v, u]
+                else:
+                    edata = {}
+                length = edata.get('length', 0.0)
+                width = edata.get('width', ccfg['default_width_m'])
+                cap_ppm = edata.get('capacity_ppm',
+                                    width * ccfg['effective_width_ratio']
+                                    * ccfg['ped_flow_rate_ppm'])
+                # 总吞吐能力 = 流率(人/分钟) × 疏散时长(分钟)
+                edge_capacities[edge_key] = cap_ppm * evac_duration_min
+                edge_lengths[edge_key] = length
+                edge_widths[edge_key] = width
+        edge_paths[(il, j)] = edges
+
+    n_edges = len(edge_capacities)
+    print(f"   🚦 Congestion data: {n_edges} unique edges, "
+          f"{len(edge_paths)} path-edge mappings")
+    if edge_widths:
+        ws = np.array(list(edge_widths.values()))
+        print(f"   📏 Edge widths: mean={ws.mean():.1f}m, "
+              f"min={ws.min():.1f}m, max={ws.max():.1f}m")
+
+    return dict(
+        edge_paths=edge_paths,
+        edge_capacities=edge_capacities,
+        edge_lengths=edge_lengths,
+        edge_widths=edge_widths,
+    )
 
 
 # ============================================================

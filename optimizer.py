@@ -180,7 +180,8 @@ def setup_deap(feasible):
 def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
                   risk_arrays, x_mins, y_maxs,
                   speed=WALK_SPEED, max_time=DEFAULT_MAX_TIME,
-                  use_sink=True, sink_config=None):
+                  use_sink=True, sink_config=None,
+                  congestion_data=None):
     """
     返回 evaluate(ind) → (time_obj, risk_obj)
 
@@ -208,6 +209,17 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
         from pickup_sink import PickupSinkModel
         sink_model = PickupSinkModel(bus_xy, risk_arrays, x_mins, y_maxs, sink_config)
 
+    # 道路拥挤度参数 (v5.7)
+    use_congestion = (congestion_data is not None)
+    if use_congestion:
+        from config import ROAD_CONGESTION_CONFIG as _ccfg
+        _edge_paths_map = congestion_data['edge_paths']
+        _edge_caps = congestion_data['edge_capacities']
+        _edge_lens = congestion_data['edge_lengths']
+        _bpr_alpha = _ccfg['bpr_alpha']
+        _bpr_beta = _ccfg['bpr_beta']
+        _cong_weight = _ccfg['congestion_weight']
+
     def evaluate(ind):
         # ── Phase 1: 步行阶段 ──
         infos, times = [], []
@@ -227,6 +239,24 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
             return (np.inf, np.inf)
 
         walk_time_weighted = sum(t * p for t, p in zip(times, pop_arr))
+
+        # ── 道路拥挤度惩罚 (v5.7) ──
+        if use_congestion:
+            edge_flow = {}
+            for i in range(n):
+                j_stop = infos[i][2]
+                for ek in _edge_paths_map.get((i, j_stop), ()):
+                    edge_flow[ek] = edge_flow.get(ek, 0.0) + pop_arr[i]
+            congestion_delay = 0.0
+            for ek, flow in edge_flow.items():
+                cap = _edge_caps.get(ek, 1e18)
+                if cap > 0 and flow > cap:
+                    vc = flow / cap
+                    length = _edge_lens.get(ek, 0.0)
+                    free_t = length / speed
+                    delay = free_t * _bpr_alpha * (vc ** _bpr_beta)
+                    congestion_delay += delay * flow
+            walk_time_weighted += _cong_weight * congestion_delay
 
         # ── Phase 2: 步行风险 (沿路径累积) ──
         walk_risk = 0.0
