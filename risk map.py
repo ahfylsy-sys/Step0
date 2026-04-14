@@ -1,351 +1,401 @@
 import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-import contextily as ctx
-from pyproj import CRS, Transformer
+from scipy.stats import gaussian_kde, pearsonr
+import openpyxl
 import warnings
+import time as _time
 
 warnings.filterwarnings("ignore")
 
 # ==============================
-# 用户配置区（请根据实际情况修改）
+# User Configuration
 # ==============================
 
-# 1. CSV 文件夹路径
-CSV_FOLDERS = [
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\Short_Dose\TIME_SERIES\15\CALPOST\effect",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\Short_Dose\TIME_SERIES\25\CALPOST\effect",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\Short_Dose\TIME_SERIES\35\CALPOST\effect",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\Short_Dose\TIME_SERIES\45\CALPOST\effect",
-]
+DATA_ROOT = r"E:\Claude code\WORK-2\Data"
+TS_ROOT   = os.path.join(DATA_ROOT, "Short_Dose", "TIME_SERIES")
+EXCEL_PATH = os.path.join(DATA_ROOT, "source term-SORACA-process.xlsx")
+OUTPUT_DIR = DATA_ROOT
 
-# 指定 Excel 保存路径（可自定义）
-OUTPUT_EXCELS = [
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\cvar_risk_map_output15.xlsx",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\cvar_risk_map_output25.xlsx",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\cvar_risk_map_output35.xlsx",
-    r"E:\LIUSHENGYU\WORK2-EVACUATION\Data\cvar_risk_map_output45.xlsx",
-]
+DOSE_TIMES = [15, 30, 45]          # dose snapshot times (min from plume start)
+EVAC_TIMES = [15, 30, 45]          # evacuation times to evaluate (min from depart)
+DEPART_DELAY = 0.5                 # hours (30 min)
 
-time_labels = ['15', '25', '35', '45']
+GRID_SIZE  = 100
+CELL_SIZE_M = 400.0
+PLANT_X    = 247413.0              # UTM Easting (m)
+PLANT_Y    = 2501099.0             # UTM Northing (m)
+UTM_ZONE   = "50N"
+CONFIDENCE_LEVEL = 0.99
 
-times = [15, 25, 35, 45]
+N_SAMPLES  = 4996                  # must match number of scenario files
+RANDOM_SEED = 42
 
 plt.rcParams['font.family'] = 'Times New Roman'
 
-# 2. 核电厂 UTM 坐标
-UTM_ZONE = "50N"
-PLANT_X = 247413.0  # UTM Easting (m)
-PLANT_Y = 2501099.0  # UTM Northing (m)
-
-# 3. 网格参数
-GRID_SIZE = 100  # 100x100
-CELL_SIZE_M = 400.0  # 每个网格 400 米
-
-# 4. CVaR 参数
-CONFIDENCE_LEVEL = 0.99  # 95% 置信区间
-RISK_THRESHOLDS = []  # 风险阈值 (Sv)，超过此值认为有风险，可根据实际需求调整
-for time in times:
-    risk_threshold = 0.05 / 7 / 16 / 24 * (time / 60)
-    RISK_THRESHOLDS.append(risk_threshold)
-
-# 打印每个时间点对应的阈值
-print("各时间点的风险阈值:")
-for t, th in zip(time_labels, RISK_THRESHOLDS):
-    print(f"  时间 {t} 分钟: {th:.6e} Sv")
-
-# 5. 输出图像保存路径前缀
-OUTPUT_PNG_PREFIX = "cvar_risk_map"
-OUTPUT_PNG_PATH = r"E:/LIUSHENGYU/WORK2-EVACUATION/figure/cvar_risk_map"
-
-
 # ==============================
-# 辅助函数
+# Step 1: Read Source-Term Timing
 # ==============================
 
-def calculate_cvar(doses, confidence_level=0.99):
-    """
-    计算条件风险价值 (CVaR / Expected Shortfall)
+print("=" * 65)
+print("  CVaR Risk Map with Dual Uncertainty")
+print("  (Onset-of-Release x GE-Declaration timing adjustment)")
+print("=" * 65)
 
-    参数:
-        doses: 剂量数组（所有情景下该网格的剂量值）
-        confidence_level: 置信水平，默认95%
+print("\n[Step 1] Reading source-term timing data ...")
 
-    返回:
-        var_value: VaR值（置信区间的分位数）
-        cvar_value: CVaR值（超过VaR的尾部平均值）
-    """
-    if len(doses) == 0 or np.all(doses == 0):
-        return 0.0, 0.0
+wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
+ws = wb['Sheet1']
 
-    # 从小到大排序
-    sorted_doses = np.sort(doses)
+categories, onset_vals, ge_vals, rel_freqs = [], [], [], []
+for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+    name   = row[0].value
+    onset  = row[11].value        # col L: Onset of release (hr)
+    ge     = row[12].value        # col M: GE declaration (hr)
+    rfreq  = row[2].value         # col C: relative frequency
+    if name is None or onset is None or ge is None:
+        continue
+    categories.append(str(name).strip())
+    onset_vals.append(float(onset))
+    ge_vals.append(float(ge))
+    rel_freqs.append(float(rfreq) if rfreq else 0.0)
 
-    # 计算 VaR（Value at Risk）：95%置信区间的上界（即第95百分位数）
-    var_index = int(np.ceil(confidence_level * len(sorted_doses))) - 1
-    var_index = min(var_index, len(sorted_doses) - 1)  # 防止越界
-    var_value = sorted_doses[var_index]
+onset_arr = np.array(onset_vals)
+ge_arr    = np.array(ge_vals)
+offset_arr = onset_arr - ge_arr - DEPART_DELAY
 
-    # 计算 CVaR（Conditional VaR）：超过VaR的尾部平均值
-    # 即取超过第95百分位数的所有值的平均
-    tail_values = sorted_doses[sorted_doses >= var_value]
-
-    if len(tail_values) == 0:
-        cvar_value = var_value
-    else:
-        cvar_value = np.mean(tail_values)
-
-    return var_value, cvar_value
-
-
-def calculate_cvar_alternative(doses, confidence_level=0.99):
-    """
-    CVaR 的另一种计算方式：使用连续近似
-
-    对于离散样本，CVaR = E[X | X >= VaR]
-    这里使用更精确的计算方式，考虑分位数的线性插值
-    """
-    if len(doses) == 0 or np.all(doses == 0):
-        return 0.0, 0.0
-
-    sorted_doses = np.sort(doses)
-    n = len(sorted_doses)
-
-    # 使用 numpy 的 percentile 计算 VaR
-    var_value = np.percentile(sorted_doses, confidence_level * 100)
-
-    # 计算 CVaR：尾部期望值
-    # 取所有大于等于 VaR 的值的加权平均
-    alpha = 1 - confidence_level  # 尾部概率
-    tail_start_idx = int(np.floor(confidence_level * n))
-
-    if tail_start_idx >= n:
-        cvar_value = sorted_doses[-1]
-    else:
-        # 尾部值
-        tail_values = sorted_doses[tail_start_idx:]
-        cvar_value = np.mean(tail_values)
-
-    return var_value, cvar_value
-
+print(f"  {len(categories)} source-term categories loaded:")
+print(f"  {'Category':12s}  Onset(h)  GE(h)  Offset(h)  Offset(min)")
+for c, o, g, off in zip(categories, onset_arr, ge_arr, offset_arr):
+    print(f"  {c:12s}  {o:7.1f}   {g:5.2f}   {off:8.2f}    {off*60:8.1f}")
 
 # ==============================
-# 主程序
+# Step 2: Pearson Correlation
 # ==============================
 
+print("\n[Step 2] Pearson correlation ...")
+corr, pval = pearsonr(onset_arr, ge_arr)
+print(f"  r = {corr:.6f},  p = {pval:.4e}")
+strength = "Strong" if abs(corr) > 0.7 else ("Moderate" if abs(corr) > 0.4 else "Weak")
+print(f"  => {strength} positive correlation  -->  joint 2D-KDE sampling required")
+
+corr_path = os.path.join(OUTPUT_DIR, "pearson_correlation.txt")
+with open(corr_path, "w", encoding="utf-8") as f:
+    f.write(f"Pearson Correlation: Onset-of-Release vs GE-Declaration\n")
+    f.write(f"N = {len(onset_arr)} categories\n")
+    f.write(f"r = {corr:.6f}\n")
+    f.write(f"p = {pval:.4e}\n")
+    f.write(f"Strength: {strength}\n")
+print(f"  Saved: {corr_path}")
+
 # ==============================
-# 第一阶段：加载数据并计算所有 CVaR 风险图
+# Step 3: 2D KDE  +  Sampling
 # ==============================
 
-all_risk_maps = []
-all_var_maps = []
-all_dose_3ds = []
+print("\n[Step 3] Building 2D KDE and sampling ...")
 
-print("=" * 60)
-print("CVaR 风险分析程序")
-print("=" * 60)
-print(f"置信水平: {CONFIDENCE_LEVEL * 100}%")
-print("=" * 60)
+data_2d = np.vstack([onset_arr, ge_arr])
+kde = gaussian_kde(data_2d, bw_method='silverman')
 
-print("\n🔄 第一阶段：加载数据并计算所有 CVaR 风险图...")
+np.random.seed(RANDOM_SEED)
 
-for folder_idx, (CSV_FOLDER, RISK_THRESHOLD) in enumerate(zip(CSV_FOLDERS, RISK_THRESHOLDS)):
-    print(f"\n📂 处理文件夹 [{folder_idx + 1}/{len(CSV_FOLDERS)}]: {CSV_FOLDER}")
-    print(f"   时间点: {time_labels[folder_idx]} 分钟")
-    print(f"   风险阈值: {RISK_THRESHOLD:.6e} Sv")
+# Rejection sampling: Onset > GE > 0
+accepted = []
+while len(accepted) < N_SAMPLES:
+    batch = kde.resample(N_SAMPLES * 3).T
+    mask  = (batch[:, 0] > 0) & (batch[:, 1] > 0) & (batch[:, 0] >= batch[:, 1])
+    accepted.extend(batch[mask].tolist())
 
-    # --- 加载 dose_3d ---
-    csv_files = [f for f in os.listdir(CSV_FOLDER) if f.endswith('.csv')]
-    if not csv_files:
-        raise FileNotFoundError(f"未在 {CSV_FOLDER} 中找到 CSV 文件")
+samples = np.array(accepted[:N_SAMPLES])
+onset_s   = samples[:, 0]
+ge_s      = samples[:, 1]
+offset_hr = onset_s - ge_s - DEPART_DELAY
+offset_min = offset_hr * 60
 
-    print(f"   找到 {len(csv_files)} 个 CSV 文件")
+print(f"  Sampled {N_SAMPLES} valid (Onset, GE) pairs")
+print(f"  Plume-offset range: [{offset_hr.min():.2f}, {offset_hr.max():.2f}] hr")
+print(f"                    = [{offset_min.min():.1f}, {offset_min.max():.1f}] min")
+n_neg = np.sum(offset_min < 0)
+print(f"  Negative offsets (plume before evac): {n_neg} / {N_SAMPLES}")
 
-    dose_3d = []
-    for f in csv_files:
-        rows = []
-        with open(os.path.join(CSV_FOLDER, f), 'r') as file:
-            lines = file.readlines()
-        data_lines = lines[1:]  # 跳过标题行
-        for line in data_lines[:GRID_SIZE]:
-            fields = [x.strip() for x in line.split(',')]
-            row = []
-            for i in range(GRID_SIZE):
-                if i < len(fields) and fields[i] not in ('', ' '):
+csv_path = os.path.join(OUTPUT_DIR, "kde_timing_samples.csv")
+pd.DataFrame({
+    'Scenario_ID':          np.arange(1, N_SAMPLES + 1),
+    'Onset_of_Release_hr':  onset_s,
+    'GE_Declaration_hr':    ge_s,
+    'Depart_Delay_hr':      DEPART_DELAY,
+    'Plume_Offset_hr':      offset_hr,
+    'Plume_Offset_min':     offset_min,
+}).to_csv(csv_path, index=False)
+print(f"  Saved: {csv_path}")
+
+# --- KDE scatter plot ---
+fig_kde, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+ax = axes[0]
+ax.scatter(onset_arr, ge_arr, c='red', s=80, zorder=5, edgecolors='white',
+           label='Source-term categories')
+ax.scatter(onset_s, ge_s, c='steelblue', s=4, alpha=0.3, label='KDE samples')
+ax.set_xlabel('Onset of Release (hr)')
+ax.set_ylabel('GE Declaration (hr)')
+ax.set_title(f'2D KDE Sampling (r={corr:.3f})')
+ax.legend(fontsize=8)
+
+ax = axes[1]
+ax.hist(offset_min, bins=60, color='steelblue', edgecolor='white', alpha=0.8)
+ax.axvline(0, color='red', ls='--', lw=1.5, label='Evac start (t=0)')
+ax.set_xlabel('Plume Offset (min)')
+ax.set_ylabel('Frequency')
+ax.set_title('Plume Offset Distribution')
+ax.legend()
+
+fig_kde.tight_layout()
+kde_fig_path = os.path.join(OUTPUT_DIR, "kde_sampling_diagnostic.png")
+fig_kde.savefig(kde_fig_path, dpi=200)
+plt.close(fig_kde)
+print(f"  Saved: {kde_fig_path}")
+
+# ==============================
+# Step 4: Load Dose Data
+# ==============================
+
+print("\n[Step 4] Loading dose data (3 time-points x 4996 scenarios) ...")
+
+def load_dose_folder(folder, grid_size=100):
+    """Load all CSV dose grids from *folder*, return shape (N, grid, grid)."""
+    fnames = sorted(
+        [f for f in os.listdir(folder) if f.endswith('.csv')],
+        key=lambda x: int(os.path.splitext(x)[0])
+    )
+    n = len(fnames)
+    arr = np.zeros((n, grid_size, grid_size), dtype=np.float64)
+    t0 = _time.time()
+    for idx, fn in enumerate(fnames):
+        path = os.path.join(folder, fn)
+        with open(path, 'r') as fh:
+            lines = fh.readlines()
+        for ri, line in enumerate(lines[1:grid_size + 1]):
+            fields = line.split(',')
+            for ci, v in enumerate(fields[:grid_size]):
+                v = v.strip()
+                if v:
                     try:
-                        val = float(fields[i])
+                        arr[idx, ri, ci] = float(v)
                     except (ValueError, OverflowError):
-                        val = 0.0
-                else:
-                    val = 0.0
-                row.append(val)
-            rows.append(row)
-        while len(rows) < GRID_SIZE:
-            rows.append([0.0] * GRID_SIZE)
-        arr = np.array(rows[:GRID_SIZE], dtype=np.float64)
-        arr = arr[::-1]  # 行反转
-        dose_3d.append(arr)
+                        pass
+        arr[idx] = arr[idx, ::-1, :]          # flip rows
+        if (idx + 1) % 1000 == 0:
+            elapsed = _time.time() - t0
+            print(f"    {idx+1}/{n}  ({elapsed:.1f}s)")
+    elapsed = _time.time() - t0
+    print(f"    Done: {n} files in {elapsed:.1f}s")
+    return arr, fnames
 
-    dose_3d = np.array(dose_3d)
-    all_dose_3ds.append(dose_3d)
-    print(f"   数据维度: {dose_3d.shape} (情景数 × 行 × 列)")
+dose = {}
+file_lists = {}
+for t in DOSE_TIMES:
+    folder = os.path.join(TS_ROOT, str(t), "effect")
+    print(f"  Loading {t} min ...")
+    dose[t], file_lists[t] = load_dose_folder(folder)
+    print(f"    shape = {dose[t].shape}")
 
-    # --- 计算 CVaR 风险图 ---
-    risk_map = np.zeros((GRID_SIZE, GRID_SIZE))  # CVaR 值（量化风险）
-    var_map = np.zeros((GRID_SIZE, GRID_SIZE))  # VaR 值（用于判断是否有风险）
+# Verify consistency
+ns = [dose[t].shape[0] for t in DOSE_TIMES]
+assert all(n == ns[0] for n in ns), f"Inconsistent scenario counts: {ns}"
+N_ACTUAL = ns[0]
+assert N_ACTUAL == N_SAMPLES, f"File count {N_ACTUAL} != sample count {N_SAMPLES}"
+print(f"  All time-points: {N_ACTUAL} scenarios (consistent)")
 
-    risk_count = 0  # 统计有风险的网格数
+# ==============================
+# Step 5: Compute CVaR Risk Maps
+# ==============================
+
+print("\n[Step 5] Computing CVaR risk maps with timing adjustment ...")
+
+def cvar(doses, cl=0.99):
+    """Return (VaR, CVaR) at confidence level *cl*."""
+    if len(doses) == 0 or np.all(doses == 0):
+        return 0.0, 0.0
+    sd = np.sort(doses)
+    vi = min(int(np.ceil(cl * len(sd))) - 1, len(sd) - 1)
+    var_val = sd[vi]
+    tail = sd[sd >= var_val]
+    return var_val, (np.mean(tail) if len(tail) else var_val)
+
+d15 = dose[15]   # (N, 100, 100)
+d30 = dose[30]
+d45 = dose[45]
+
+all_risk = {}
+all_var  = {}
+
+for evac_t in EVAC_TIMES:
+    t0 = _time.time()
+    threshold = 0.05 / 7 / 16 / 24 * (evac_t / 60)
+    print(f"\n  --- Evacuation time = {evac_t} min ---")
+    print(f"  Risk threshold = {threshold:.6e} Sv")
+
+    # effective plume-exposure time per scenario (minutes)
+    eff = evac_t - offset_min                           # (N,)
+    n_zero = np.sum(eff <= 0)
+    print(f"  Scenarios with zero exposure (plume not yet arrived): "
+          f"{n_zero}/{N_SAMPLES} ({100*n_zero/N_SAMPLES:.1f}%)")
+
+    risk_map = np.zeros((GRID_SIZE, GRID_SIZE))
+    var_map  = np.zeros((GRID_SIZE, GRID_SIZE))
+    risk_cnt = 0
 
     for i in range(GRID_SIZE):
         for j in range(GRID_SIZE):
-            doses = dose_3d[:, i, j]
+            v15 = d15[:, i, j]
+            v30 = d30[:, i, j]
+            v45 = d45[:, i, j]
 
-            # 计算 VaR 和 CVaR
-            var_value, cvar_value = calculate_cvar(doses, CONFIDENCE_LEVEL)
+            # Piecewise-linear interpolation based on effective exposure time
+            adj = np.where(
+                eff <= 0,  0.0,
+                np.where(eff <= 15, v15 * (eff / 15.0),
+                np.where(eff <= 30, v15 + (v30 - v15) * (eff - 15.0) / 15.0,
+                np.where(eff <= 45, v30 + (v45 - v30) * (eff - 30.0) / 15.0,
+                         v45))))
 
-            var_map[i, j] = var_value
+            vv, cv = cvar(adj, CONFIDENCE_LEVEL)
+            var_map[i, j] = vv
+            if vv >= threshold:
+                risk_map[i, j] = cv
+                risk_cnt += 1
 
-            # 判断是否有风险：当 VaR（95%置信区间的最大值）超过阈值时
-            if var_value >= RISK_THRESHOLD:
-                risk_map[i, j] = cvar_value  # 量化风险为 CVaR
-                risk_count += 1
-            else:
-                risk_map[i, j] = 0.0  # 无风险
+    all_risk[evac_t] = risk_map
+    all_var[evac_t]  = var_map
 
-    all_risk_maps.append(risk_map)
-    all_var_maps.append(var_map)
+    elapsed = _time.time() - t0
+    print(f"  Risk cells: {risk_cnt}/{GRID_SIZE**2} ({100*risk_cnt/GRID_SIZE**2:.2f}%)")
+    if risk_cnt > 0:
+        nz = risk_map[risk_map > 0]
+        print(f"  CVaR range: [{nz.min():.4e}, {nz.max():.4e}] Sv")
+        print(f"  CVaR mean:  {nz.mean():.4e} Sv")
+    print(f"  Elapsed: {elapsed:.1f}s")
 
-    print(f"   有风险网格数: {risk_count} / {GRID_SIZE * GRID_SIZE}")
-    print(f"   CVaR 最大值: {np.max(risk_map):.4e} Sv")
-    print(f"   CVaR 非零平均值: {np.mean(risk_map[risk_map > 0]):.4e} Sv" if risk_count > 0 else "   无有效风险数据")
+# ==============================
+# Step 6: Save Results
+# ==============================
 
-# --- 收集所有非零风险值，用于全局 colorbar ---
-all_nonzero_risks = np.concatenate([rm[rm > 0].flatten() for rm in all_risk_maps if np.any(rm > 0)])
+print("\n[Step 6] Saving results ...")
 
-if len(all_nonzero_risks) == 0:
-    print("\n⚠️ 警告：所有风险图均为零！可能需要降低风险阈值。")
-    global_vmin = min(RISK_THRESHOLDS)  # 使用最小阈值
-    global_vmax = max(RISK_THRESHOLDS) * 10
+for evac_t in EVAC_TIMES:
+    rm = all_risk[evac_t]
+    vm = all_var[evac_t]
+
+    p1 = os.path.join(OUTPUT_DIR, f"cvar_risk_map_{evac_t}.xlsx")
+    pd.DataFrame(rm[::-1]).to_excel(p1, index=False, header=False)
+    print(f"  {p1}")
+
+    p2 = os.path.join(OUTPUT_DIR, f"cvar_risk_map_{evac_t}_VAR.xlsx")
+    pd.DataFrame(vm[::-1]).to_excel(p2, index=False, header=False)
+    print(f"  {p2}")
+
+# ==============================
+# Step 7: Plot Risk Maps
+# ==============================
+
+print("\n[Step 7] Plotting risk maps ...")
+
+try:
+    from pyproj import CRS, Transformer
+    import contextily as ctx
+    HAS_GEO = True
+except ImportError:
+    HAS_GEO = False
+    print("  (contextily/pyproj not installed -- plain plot)")
+
+# Global colorbar range across all time-points
+all_nz = np.concatenate([rm[rm > 0].ravel() for rm in all_risk.values()
+                         if np.any(rm > 0)])
+if len(all_nz):
+    g_vmin = max(np.percentile(all_nz, 1),
+                 min(0.05/7/16/24*(t/60) for t in EVAC_TIMES))
+    g_vmax = np.percentile(all_nz, 99)
 else:
-    fixed_min = min(RISK_THRESHOLDS)  # 使用最小阈值作为下限
-    global_vmin = max(np.percentile(all_nonzero_risks, 1), fixed_min)
-    global_vmax = np.percentile(all_nonzero_risks, 99)
+    g_vmin, g_vmax = 1e-10, 1e-6
 
-print(f"\n✅ 全局风险范围: vmin={global_vmin:.3e}, vmax={global_vmax:.3e}")
+for evac_t in EVAC_TIMES:
+    risk_map = all_risk[evac_t]
+    threshold = 0.05 / 7 / 16 / 24 * (evac_t / 60)
 
-# ==============================
-# 第二阶段：用统一 colorbar 绘图 + 保存 Excel
-# ==============================
-
-print("\n🔄 第二阶段：绘制风险图并保存数据...")
-
-for idx, (CSV_FOLDER, OUTPUT_EXCEL, time_label, RISK_THRESHOLD) in enumerate(
-        zip(CSV_FOLDERS, OUTPUT_EXCELS, time_labels, RISK_THRESHOLDS)):
-    risk_map = all_risk_maps[idx]
-    var_map = all_var_maps[idx]
-
-    print(f"\n📊 处理时间点: {time_label} 分钟")
-    print(f"   当前阈值: {RISK_THRESHOLD:.6e} Sv")
-
-    # 地理配准
     half = GRID_SIZE // 2
-    x_centers = PLANT_X + (np.arange(GRID_SIZE) - half) * CELL_SIZE_M
-    y_centers = PLANT_Y + (np.arange(GRID_SIZE) - half) * CELL_SIZE_M
-    x_min = x_centers[0] - CELL_SIZE_M / 2
-    x_max = x_centers[-1] + CELL_SIZE_M / 2
-    y_min = y_centers[0] - CELL_SIZE_M / 2
-    y_max = y_centers[-1] + CELL_SIZE_M / 2
+    x_c = PLANT_X + (np.arange(GRID_SIZE) - half) * CELL_SIZE_M
+    y_c = PLANT_Y + (np.arange(GRID_SIZE) - half) * CELL_SIZE_M
 
-    crs_utm = CRS(f"+proj=utm +zone={UTM_ZONE.split('N')[0]} +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
-    crs_wgs84 = CRS("EPSG:4326")
-    transformer = Transformer.from_crs(crs_utm, crs_wgs84, always_xy=True)
-    lon_min, lat_min = transformer.transform(x_min, y_min)
-    lon_max, lat_max = transformer.transform(x_max, y_max)
+    if HAS_GEO:
+        crs_utm   = CRS(f"+proj=utm +zone=50 +north +ellps=WGS84 +datum=WGS84 +units=m")
+        crs_wgs   = CRS("EPSG:4326")
+        tr        = Transformer.from_crs(crs_utm, crs_wgs, always_xy=True)
+        lo0, la0  = tr.transform(x_c[0] - CELL_SIZE_M/2, y_c[0] - CELL_SIZE_M/2)
+        lo1, la1  = tr.transform(x_c[-1]+ CELL_SIZE_M/2, y_c[-1]+ CELL_SIZE_M/2)
+        extent = [lo0, lo1, la0, la1]
+    else:
+        extent = [x_c[0], x_c[-1], y_c[0], y_c[-1]]
 
-    # 绘图
-    fig, ax = plt.subplots(figsize=(12, 10), dpi=300)
-    ax.set_xlim(lon_min, lon_max)
-    ax.set_ylim(lat_min, lat_max)
+    fig, ax = plt.subplots(figsize=(12, 10), dpi=200)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
 
-    ctx.add_basemap(ax, crs=crs_wgs84, source=ctx.providers.CartoDB.Positron, attribution=False)
+    if HAS_GEO:
+        try:
+            ctx.add_basemap(ax, crs=crs_wgs, source=ctx.providers.CartoDB.Positron,
+                            attribution=False)
+        except Exception:
+            pass
 
-    # 对数色阶设置
     eps = 1e-20
-    safe_vmin = max(global_vmin, eps)
-    safe_vmax = max(global_vmax, safe_vmin * 1.1)
-
-    norm = LogNorm(vmin=safe_vmin, vmax=safe_vmax)
+    norm = LogNorm(vmin=max(g_vmin, eps), vmax=max(g_vmax, g_vmin*1.1))
     cmap = plt.get_cmap('rainbow')
+    rgba = cmap(norm(np.where(risk_map > 0, risk_map, np.nan)))
+    rgba[:, :, 3] = np.where(risk_map > 0, 0.6, 0.0)
 
-    # 应用归一化
-    rgba_img = cmap(norm(np.where(risk_map > 0, risk_map, np.nan)))
+    ax.imshow(rgba, extent=extent, origin='lower', interpolation='nearest', zorder=2)
 
-    # 设置透明度：仅有风险的区域显示
-    rgba_img[:, :, 3] = np.where(risk_map > 0, 0.6, 0.0)
-
-    # 绘图
-    im = ax.imshow(
-        rgba_img,
-        extent=[lon_min, lon_max, lat_min, lat_max],
-        origin='lower',
-        interpolation='nearest',
-        zorder=2
-    )
-
-    # Colorbar
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, shrink=0.6)
-    cbar.set_label(f'CVaR Risk Value (Sv)\n[{int(CONFIDENCE_LEVEL * 100)}% Confidence Level]', rotation=90)
+    cbar.set_label(f'CVaR (Sv)  [{int(CONFIDENCE_LEVEL*100)}% CL]')
 
-    # 标题 - 使用当前时间点对应的阈值
-    ax.set_title(f'CVaR Risk Map - Time: {time_label} min\nThreshold: {RISK_THRESHOLD:.4e} Sv', fontsize=14)
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
+    ax.set_title(f'CVaR Risk Map  |  Evac Time = {evac_t} min\n'
+                 f'Threshold = {threshold:.4e} Sv  |  Dual-Uncertainty Adjusted',
+                 fontsize=13)
+    ax.set_xlabel('Longitude' if HAS_GEO else 'UTM Easting (m)')
+    ax.set_ylabel('Latitude'  if HAS_GEO else 'UTM Northing (m)')
 
-    # 保存图像
-    output_png = f"{OUTPUT_PNG_PATH}/{OUTPUT_PNG_PREFIX}_{time_label}.png"
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=300, bbox_inches='tight')
+    fig.tight_layout()
+    png = os.path.join(OUTPUT_DIR, f"cvar_risk_map_{evac_t}.png")
+    fig.savefig(png, dpi=200, bbox_inches='tight')
     plt.close(fig)
-    print(f"   ✅ 风险地图已保存: {output_png}")
-
-    # 保存 Excel - CVaR 风险矩阵
-    df_risk = pd.DataFrame(risk_map).iloc[::-1]
-    df_risk.to_excel(OUTPUT_EXCEL, index=False, header=False)
-    print(f"   ✅ CVaR 风险矩阵已保存: {OUTPUT_EXCEL}")
-
-    # 额外保存 VaR 矩阵（可选）
-    var_excel = OUTPUT_EXCEL.replace('.xlsx', '_VAR.xlsx')
-    df_var = pd.DataFrame(var_map).iloc[::-1]
-    df_var.to_excel(var_excel, index=False, header=False)
-    print(f"   ✅ VaR 矩阵已保存: {var_excel}")
+    print(f"  {png}")
 
 # ==============================
-# 第三阶段：统计摘要
+# Step 8: Summary
 # ==============================
 
-print("\n" + "=" * 60)
-print("统计摘要")
-print("=" * 60)
+print("\n" + "=" * 65)
+print("  SUMMARY")
+print("=" * 65)
+print(f"  Pearson r(Onset, GE) = {corr:.4f}")
+print(f"  Plume offset range   = [{offset_min.min():.1f}, {offset_min.max():.1f}] min")
+print(f"  Negative offsets     = {n_neg} / {N_SAMPLES}")
+for evac_t in EVAC_TIMES:
+    rm = all_risk[evac_t]
+    rc = np.sum(rm > 0)
+    threshold = 0.05 / 7 / 16 / 24 * (evac_t / 60)
+    print(f"\n  Evac {evac_t} min  (threshold = {threshold:.4e} Sv):")
+    print(f"    Risk cells = {rc}/{GRID_SIZE**2}")
+    if rc > 0:
+        print(f"    CVaR max   = {np.max(rm):.4e} Sv")
+        print(f"    CVaR mean  = {np.mean(rm[rm>0]):.4e} Sv")
 
-for idx, (time_label, RISK_THRESHOLD) in enumerate(zip(time_labels, RISK_THRESHOLDS)):
-    risk_map = all_risk_maps[idx]
-    var_map = all_var_maps[idx]
-
-    risk_cells = np.sum(risk_map > 0)
-    total_cells = GRID_SIZE * GRID_SIZE
-
-    print(f"\n时间点 {time_label} 分钟 (阈值: {RISK_THRESHOLD:.4e} Sv):")
-    print(f"  - 有风险网格: {risk_cells} / {total_cells} ({100 * risk_cells / total_cells:.2f}%)")
-
-    if risk_cells > 0:
-        print(f"  - CVaR 范围: [{np.min(risk_map[risk_map > 0]):.4e}, {np.max(risk_map):.4e}] Sv")
-        print(f"  - CVaR 平均值: {np.mean(risk_map[risk_map > 0]):.4e} Sv")
-        print(f"  - VaR 最大值: {np.max(var_map):.4e} Sv")
-
-print("\n" + "=" * 60)
-print("✅ 所有处理完成！")
-print("=" * 60)
+print("\n" + "=" * 65)
+print("  All processing complete!")
+print("=" * 65)
