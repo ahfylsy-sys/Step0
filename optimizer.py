@@ -15,6 +15,7 @@ from deap import base, creator, tools, algorithms
 from config import (
     WALK_SPEED, GRID_RES, MAX_WALK_TIME,
     NSGA2_CONFIG, QNSGA2_CONFIG,
+    RISK_STAGE_TIMES,
 )
 
 DEFAULT_MAX_TIME = 45 * 60
@@ -181,7 +182,11 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
                   risk_arrays, x_mins, y_maxs,
                   speed=WALK_SPEED, max_time=DEFAULT_MAX_TIME,
                   use_sink=True, sink_config=None,
-                  congestion_data=None):
+                  congestion_data=None,
+                  shelter_xy=None, shelter_capacities=None,
+                  depot_xy=None,
+                  road_graph=None, stop_nodes=None,
+                  shelter_nodes=None, depot_node=None):
     """
     返回 evaluate(ind) → (time_obj, risk_obj)
 
@@ -195,9 +200,11 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
         queue_risk: 在上车点排队等待巴士期间累积
 
     参数:
-        use_sink    – 是否启用 sink 边界条件 (默认启用)
-                      若 False, 退化为原始模型 (仅步行时间+步行风险)
-        sink_config – PickupSinkModel 配置, None 时使用默认值
+        use_sink           – 是否启用 sink 边界条件 (默认启用)
+        sink_config        – PickupSinkModel 配置, None 时使用默认值
+        shelter_xy         – (n_shelters, 2) 避难所 UTM 坐标
+        shelter_capacities – (n_shelters,) 避难所容量
+        depot_xy           – (2,) 巴士总站 UTM 坐标 (大鹏总站)
     """
     n = len(res_x)
     t_lim_min = int(max_time / 60)
@@ -207,7 +214,14 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
     sink_model = None
     if use_sink:
         from pickup_sink import PickupSinkModel
-        sink_model = PickupSinkModel(bus_xy, risk_arrays, x_mins, y_maxs, sink_config)
+        sink_model = PickupSinkModel(
+            bus_xy, risk_arrays, x_mins, y_maxs,
+            shelter_xy, shelter_capacities, sink_config,
+            depot_xy=depot_xy,
+            road_graph=road_graph,
+            stop_nodes=stop_nodes,
+            shelter_nodes=shelter_nodes,
+            depot_node=depot_node)
 
     # 道路拥挤度参数 (v5.7)
     use_congestion = (congestion_data is not None)
@@ -260,9 +274,17 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
 
         # ── Phase 2: 步行风险 (沿路径累积) ──
         walk_risk = 0.0
+        n_stages = len(RISK_STAGE_TIMES)
         for minute in range(t_lim_min):
             ts = minute * 60
-            si = 0 if minute < 15 else (1 if minute < 25 else (2 if minute < 35 else 3))
+            # 根据时刻选择对应的风险阶段
+            si = 0
+            for k in range(n_stages):
+                if minute < RISK_STAGE_TIMES[k]:
+                    si = k
+                    break
+            else:
+                si = n_stages - 1
             ra, xm, ym = risk_arrays[si], x_mins[si], y_maxs[si]
             rt = 0.0
             for i in range(n):
@@ -287,13 +309,18 @@ def make_evaluate(res_x, res_y, pop_arr, bus_xy, road_paths,
         arrival_times = np.array(times, dtype=np.float64)
 
         try:
-            T_total, R_total, _ = sink_model.process(
+            T_total, R_total, sink_info = sink_model.process(
                 assignment=list(ind),
                 arrival_times=arrival_times,
                 pop_arr=pop_np,
                 walk_risk=walk_risk,
             )
         except Exception:
+            return (np.inf, np.inf)
+
+        # ── 硬约束: 巴士到达时上车点已被风险覆盖 → 不可行解 ──
+        # 如果有居民因上车点关闭而无法疏散, 该解直接判为不可行
+        if sink_info.get("unevacuated_pop", 0) > 1e-6:
             return (np.inf, np.inf)
 
         # T_total 是全员撤离总时长 (秒); 转为人口加权形式与原口径一致
@@ -513,7 +540,14 @@ def compute_metrics(assignment, res_df, bus_xy, active_idx, paths,
 
     for minute in range(int(max_time / 60) + 1):
         ts = minute * 60
-        si = 0 if minute <= 15 else (1 if minute <= 25 else (2 if minute <= 35 else 3))
+        n_stages = len(RISK_STAGE_TIMES)
+        si = 0
+        for k in range(n_stages):
+            if minute <= RISK_STAGE_TIMES[k]:
+                si = k
+                break
+        else:
+            si = n_stages - 1
         ra, xm, ym = risk_arrays[si], x_mins[si], y_maxs[si]
         for i in range(len(res_df)):
             j = assignment[i]

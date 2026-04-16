@@ -10,20 +10,22 @@ WALK_SPEED      = 2.04          # 默认步行速度 (m/s)
 GRID_RES        = 400           # 风险场网格分辨率 (m)
 MAX_WALK_TIME   = 45 * 60      # 最大允许步行时间 (s)
 CENTER_UTM      = (247413, 2501099)   # 核电厂中心 (UTM-50N)
-STAGE_TIMES     = [0, 15, 25, 35, 45] # 疏散阶段时间节点 (min)
+STAGE_TIMES     = [0, 15, 30, 45] # 疏散阶段时间节点 (min), len=4 (含 t=0)
+# 风险矩阵对应的时间节点 (min), 与 RISK_VALUE_FILES 一一对应
+RISK_STAGE_TIMES = [15, 30, 45]
 CRS_UTM         = "EPSG:32650"
 CRS_WGS84       = "EPSG:4326"
 
 # ======================== 数据路径 ========================
-DATA_ROOT   = r"E:\LIUSHENGYU\WORK2-EVACUATION\Data"
-OUTPUT_ROOT = r"E:\LIUSHENGYU\WORK2-EVACUATION\figure"
+DATA_ROOT   = r"e:\Claude code\WORK-2\Data"
+OUTPUT_ROOT = r"E:\Q-NSGA2-Results"
 
 RISK_VALUE_FILES = [
-    os.path.join(DATA_ROOT, f"cvar_risk_map_output{t}.xlsx") for t in [15, 25, 35, 45]
+    os.path.join(DATA_ROOT, "cvar_risk", f"cvar_risk_map_output_{t}.xlsx") for t in [15, 30, 45]
 ]
 ROAD_NETWORK_SHP = os.path.join(DATA_ROOT, "road_data", "Shenzhen_Roads_Clip.shp")
 BUS_FILE         = os.path.join(DATA_ROOT, "pickup_poi_all_aggregated_with_blacklist.xlsx")
-ROAD_CLIP_RADIUS = 10_000  # 路网裁剪半径 (m)
+ROAD_CLIP_RADIUS = 50_000  # 路网裁剪半径 (m) = 50 km
 
 # ======================== 人口分组 ========================
 AGE_GROUPS   = ["20-29", "30-39", "40-49", "50-59", "60-69", "70+"]
@@ -35,8 +37,8 @@ WALK_SPEEDS  = [2.01, 1.94, 1.87, 1.81, 1.70, 1.55,
 
 # ======================== NSGA-II 基础参数 ========================
 NSGA2_CONFIG = dict(
-    mu       = 400,    # 种群大小
-    lambda_  = 400,    # 子代数量
+    mu       = 200,    # 种群大小
+    lambda_  = 200,    # 子代数量
     ngen     = 160,    # 迭代代数
     cxpb     = 0.7,    # 交叉概率
     mutpb    = 0.2,    # 变异概率
@@ -90,6 +92,30 @@ PARETO_VIZ = dict(
     highlight_size = 150,
     save_interval  = 20,
 )
+
+# ======================== 巴士总站 ========================
+BUS_DEPOT = (240167, 2501014)   # 大鹏总站 UTM-50N 坐标
+
+# ======================== 避难所配置 ========================
+SHELTER_FILE = os.path.join(DATA_ROOT, "Shelter_with_coords.xlsx")
+SHELTER_CONFIG = dict(
+    radius_m             = 30_000,   # 避难所距核电厂半径 (m) = 30 km
+    capacity_per_shelter = 10000,    # 每个避难所容量 (人)
+    shelter_file         = SHELTER_FILE,  # 避难所 Excel (列: Number, lon, lat, Capacity)
+    # 避难所数量由容量需求自动确定, 不再固定
+)
+
+# ======================== 风险场关闭阈值 ========================
+RISK_CLOSURE_THRESHOLD = 0.0   # 上车点风险值超过此阈值即视为"被风险场覆盖"而关闭
+
+# ======================== 上车点风险过滤 ========================
+PICKUP_RISK_FILTER = dict(
+    enabled        = True,
+    risk_threshold = 0.0,     # t=15min 时风险值超过此阈值的上车点被排除出可行域
+)
+
+# ======================== 道路距离修正因子 ========================
+ROAD_DISTANCE_FACTOR = 1.3    # Euclidean → 实际道路距离修正系数 (用于避难所等长距离路线)
 
 # ======================== 日志 ========================
 LOG_DIR = os.path.join(OUTPUT_ROOT, "logs")

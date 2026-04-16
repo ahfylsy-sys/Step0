@@ -135,13 +135,14 @@ def export_results_excel(all_results, bus_xy, output_path):
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as w:
         df.sort_values(["bus_stop_id", "group_name"]).to_excel(
-            w, "Assignment", index=False)
-        pd.DataFrame(stats).to_excel(w, "Group_Stats", index=False)
+            w, sheet_name="Assignment", index=False)
+        pd.DataFrame(stats).to_excel(w, sheet_name="Group_Stats", index=False)
         pivot = df.pivot_table(
             index="bus_stop_id", columns="group_name",
             values="population", aggfunc="sum", fill_value=0)
         pivot["total"] = pivot.sum(axis=1)
-        pivot.sort_values("total", ascending=False).to_excel(w, "Pop_by_Stop")
+        pivot.sort_values("total", ascending=False).to_excel(
+            w, sheet_name="Pop_by_Stop")
 
     print(f"✅ Excel saved: {output_path}  "
           f"({len(df)} records, {len(stats)} groups)")

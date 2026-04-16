@@ -21,19 +21,23 @@ from multiprocessing import Pool, cpu_count
 from config import (
     CENTER_UTM, RISK_VALUE_FILES, ROAD_NETWORK_SHP,
     OUTPUT_ROOT, ROAD_CLIP_RADIUS, NSGA2_CONFIG, PARETO_VIZ,
+    BUS_DEPOT,
 )
 from data_loader import (
     load_resident_data, load_bus_stops, load_all_risk_data,
     load_road_network, precompute_paths, build_feasible,
     build_group_configs, build_congestion_data,
+    load_shelters, filter_stops_by_risk,
 )
 from config import ROAD_CONGESTION_CONFIG
+from pickup_sink import SINK_CONFIG
 from optimizer import (
     setup_deap, make_evaluate, run_qnsga2,
     select_solution, compute_metrics,
 )
 from visualization import (
     ParetoVisualizer, plot_assignment_map, plot_evacuation_stages,
+    plot_bus_animation,
 )
 from export import (
     EvacLogger, export_pareto_csv, export_results_excel,
@@ -66,7 +70,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
     os.makedirs(out, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"🔬 {name}  speed={speed} m/s  selection={selection_method}")
+    print(f"Group {name}  speed={speed} m/s  selection={selection_method}")
     print(f"{'='*60}")
 
     # ---------- 日志 ----------
@@ -83,6 +87,20 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
     active_idx = list(range(len(res_df)))
     bus_list   = list(range(len(bus_xy)))
 
+    # ---------- Step 1.5: 上车点风险过滤 ----------
+    # 排除在 t≤15min 已被风险场覆盖的上车点 (距核电厂过近)
+    safe_stop_indices = filter_stops_by_risk(
+        bus_xy, risk_arrays, x_mins, y_maxs)
+    bus_list = [j for j in bus_list if j in safe_stop_indices]
+    if not bus_list:
+        raise ValueError("No safe bus stops after risk filtering!")
+    print(f"   Safe bus stops: {len(bus_list)}/{len(bus_xy)}")
+
+    # 预估总人口 (用于确定避难所数量)
+    total_pop_est = float(res_df["pop"].sum())
+    shelter_xy, shelter_capacities = load_shelters(
+        center=CENTER_UTM, total_pop=total_pop_est)
+
     logger.log(f"Residents: {len(res_df)}  Bus stops: {len(bus_xy)}")
 
     # ---------- Step 2: 预计算路径 ----------
@@ -90,8 +108,14 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
         res_df, bus_xy, G, active_idx, bus_list, kd, nids, ncoords)
 
     # ---------- Step 3: 可行域 ----------
+    # 传入巴士可达性参数: 巴士必须在上车点关闭前到达
     feasible, no_opt = build_feasible(
-        road_paths, len(active_idx), bus_list, max_t, speed)
+        road_paths, len(active_idx), bus_list, max_t, speed,
+        bus_xy=bus_xy, risk_arrays=risk_arrays, x_mins=x_mins, y_maxs=y_maxs,
+        depot_xy=np.array(BUS_DEPOT),
+        bus_speed_ms=SINK_CONFIG["bus_speed_ms"],
+        dispatch_delay_sec=SINK_CONFIG["dispatch_delay_sec"],
+    )
 
     # ---------- Step 4: 过滤无选项居民 ----------
     valid_ai, valid_f, valid_sr = [], [], []
@@ -102,7 +126,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
             valid_sr.append(snapped_res[il])
     excl = len(active_idx) - len(valid_ai)
     if excl:
-        print(f"   ❌ Excluded {excl} residents (no reachable stop)")
+        print(f"   Excluded {excl} residents (no reachable stop)")
         logger.log(f"Excluded: {excl}")
 
     # 重映射路径索引
@@ -139,36 +163,69 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
 
     if accelerate:
         from optimizer_accel import make_evaluate_accel, run_qnsga2_accel
-        print(f"\n   🚀 ACCELERATED MODE (GPU={use_gpu}, threads={n_eval_threads or 'auto'})")
+        print(f"\n   ACCELERATED MODE (GPU={use_gpu}, threads={n_eval_threads or 'auto'})")
         if use_sink:
-            print(f"   ⚠️  Sink boundary not supported in accel mode, falling back to standard evaluate")
+            print(f"   Sink boundary not supported in accel mode, falling back to standard evaluate")
+            # 计算上车点和避难所对应的路网节点
+            stop_nodes_eval = []
+            for j in range(len(snapped_bus)):
+                _, ni = kd.query(snapped_bus[j])
+                stop_nodes_eval.append(int(nids[ni]))
+            shelter_nodes_eval = []
+            for si in range(len(shelter_xy)):
+                _, ni = kd.query(shelter_xy[si])
+                shelter_nodes_eval.append(int(nids[ni]))
+            _, depot_ni_eval = kd.query(np.array(BUS_DEPOT))
+            depot_node_eval = int(nids[depot_ni_eval])
+
             ev = make_evaluate(
                 snapped_res[:, 0], snapped_res[:, 1], res_pop,
                 snapped_bus, road_paths, risk_arrays, x_mins, y_maxs, speed, max_t,
-                use_sink=True, congestion_data=congestion_data)
+                use_sink=True, congestion_data=congestion_data,
+                shelter_xy=shelter_xy, shelter_capacities=shelter_capacities,
+                depot_xy=np.array(BUS_DEPOT),
+                road_graph=G,
+                stop_nodes=stop_nodes_eval,
+                shelter_nodes=shelter_nodes_eval,
+                depot_node=depot_node_eval)
         else:
             ev = make_evaluate_accel(
                 snapped_res[:, 0], snapped_res[:, 1], res_pop,
                 snapped_bus, road_paths, risk_arrays, x_mins, y_maxs, speed, max_t,
                 use_gpu=use_gpu)
     else:
-        print(f"   🚏 Sink boundary: {'ON (bus dispatch + queueing)' if use_sink else 'OFF (baseline)'}")
+        print(f"   Sink boundary: {'ON (bus dispatch + queueing)' if use_sink else 'OFF (baseline)'}")
+        # 计算上车点和避难所对应的路网节点 (供evaluate闭包使用)
+        stop_nodes_eval = []
+        for j in range(len(snapped_bus)):
+            _, ni = kd.query(snapped_bus[j])
+            stop_nodes_eval.append(int(nids[ni]))
+        shelter_nodes_eval = []
+        for si in range(len(shelter_xy)):
+            _, ni = kd.query(shelter_xy[si])
+            shelter_nodes_eval.append(int(nids[ni]))
+        _, depot_ni_eval = kd.query(np.array(BUS_DEPOT))
+        depot_node_eval = int(nids[depot_ni_eval])
+
         ev = make_evaluate(
             snapped_res[:, 0], snapped_res[:, 1], res_pop,
             snapped_bus, road_paths, risk_arrays, x_mins, y_maxs, speed, max_t,
-            use_sink=use_sink, congestion_data=congestion_data)
+            use_sink=use_sink, congestion_data=congestion_data,
+            shelter_xy=shelter_xy, shelter_capacities=shelter_capacities,
+            depot_xy=np.array(BUS_DEPOT),
+            road_graph=G,
+            stop_nodes=stop_nodes_eval,
+            shelter_nodes=shelter_nodes_eval,
+            depot_node=depot_node_eval)
 
-    # 优化循环：加速模式使用 run_qnsga2_accel，标准模式内联循环（含可视化记录）
+    # 优化循环
     if accelerate:
         _, final_pf, logs = run_qnsga2_accel(
             tb, ev, feasible, logger=logger, n_eval_threads=n_eval_threads)
-
-        # 为 Pareto 可视化补充最终记录
         if final_pf:
             pv.record(NSGA2_CONFIG["ngen"], final_pf)
             pv.plot_current(NSGA2_CONFIG["ngen"], final_pf)
     else:
-        # 标准模式：带逐代可视化记录的内联循环
         from deap import tools, creator
         from optimizer import (
             QuantumIndividual, QuantumRotationGate,
@@ -275,7 +332,7 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
 
         ff = [x for x in pop if np.isfinite(x.fitness.values[0]) and np.isfinite(x.fitness.values[1])]
         final_pf = tools.sortNondominated(ff, len(ff), first_front_only=True)[0] if ff else []
-        print(f"✅ Final Pareto: {len(final_pf)} solutions")
+        print(f"Final Pareto: {len(final_pf)} solutions")
 
     # ---------- Step 7: 选择最优解 ----------
     best, method = select_solution(final_pf, selection_method)
@@ -290,8 +347,50 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
         full_assign, res_df, snapped_bus, active_idx, road_paths,
         risk_arrays, x_mins, y_maxs, res_df["pop"].values, snapped_res, speed, max_t)
 
+    # ---------- Step 8.5: 获取巴士轨迹数据 (v7.0: 含路网路径) ----------
+    bus_trajectory = []
+    if use_sink:
+        try:
+            from pickup_sink import PickupSinkModel
+            # 计算上车点和避难所对应的路网节点
+            stop_nodes = []
+            for j in range(len(snapped_bus)):
+                _, ni = kd.query(snapped_bus[j])
+                stop_nodes.append(int(nids[ni]))
+            shelter_nodes = []
+            for si in range(len(shelter_xy)):
+                _, ni = kd.query(shelter_xy[si])
+                shelter_nodes.append(int(nids[ni]))
+            _, depot_ni = kd.query(np.array(BUS_DEPOT))
+            depot_node = int(nids[depot_ni])
+
+            sink_model = PickupSinkModel(
+                snapped_bus, risk_arrays, x_mins, y_maxs,
+                shelter_xy, shelter_capacities, SINK_CONFIG,
+                depot_xy=np.array(BUS_DEPOT),
+                road_graph=G,
+                stop_nodes=stop_nodes,
+                shelter_nodes=shelter_nodes,
+                depot_node=depot_node)
+            # 计算到达时间
+            sub_arrival = []
+            for idx, i in enumerate(active_idx):
+                j = full_assign[i]
+                pl = road_paths.get((idx, j))
+                sub_arrival.append(pl.length / speed if pl else np.inf)
+            _, _, sink_info = sink_model.process(
+                assignment=[full_assign[i] for i in active_idx],
+                arrival_times=np.array(sub_arrival, dtype=np.float64),
+                pop_arr=res_df["pop"].values[active_idx],
+            )
+            bus_trajectory = sink_info.get("bus_trajectory", [])
+        except Exception as e:
+            print(f"   Failed to get bus trajectory: {e}")
+            import traceback
+            traceback.print_exc()
+
     used = set(full_assign) - {-1}
-    print(f"✅ {name}: time={total_t/60:.1f}min  risk={total_r:.2e}  stops={len(used)}")
+    print(f"Group {name}: time={total_t/60:.1f}min  risk={total_r:.2e}  stops={len(used)}")
     logger.log(f"RESULT: time={total_t/60:.1f}min  risk={total_r:.2e}  stops={len(used)}")
 
     # ---------- Step 9: 导出 ----------
@@ -303,6 +402,17 @@ def optimize_group(config, selection_method="min_risk", accelerate=False,
     plot_assignment_map(risk_arrays[-1], snapped_bus, full_assign, res_df, active_idx, out)
     plot_evacuation_stages(risk_arrays, snapped_bus, full_assign, res_df,
                            active_idx, road_paths, snapped_res, snapped_bus, out, speed)
+
+    # ---------- Step 10.5: 完整疏散动画 (v7.0) ----------
+    if bus_trajectory:
+        plot_bus_animation(
+            risk_arrays, snapped_bus, shelter_xy, full_assign,
+            res_df, active_idx, bus_trajectory, out, speed,
+            depot_xy=np.array(BUS_DEPOT),
+            road_graph=G,
+            road_paths=road_paths,
+            snapped_res=snapped_res,
+            snapped_bus=snapped_bus)
 
     logger.close()
 

@@ -189,11 +189,11 @@ def _eval_gpu_v3(ind, sts, nps, lens, ac, ad, bxy_cpu, pop_cpu,
     # 阶段索引
     stage_idx = np.zeros(tlim, dtype=np.int32)
     for m in range(tlim):
-        stage_idx[m] = 0 if m < 15 else (1 if m < 25 else (2 if m < 35 else 3))
+        stage_idx[m] = 0 if m < 15 else (1 if m < 30 else 2)
 
     total_risk = 0.0
-    # 按阶段分组处理 (最多 4 组, 不再逐分钟)
-    for si in range(4):
+    # 按阶段分组处理 (最多 3 组, 不再逐分钟)
+    for si in range(3):
         mask = (stage_idx == si)
         minutes_in_stage = np.where(mask)[0]
         if len(minutes_in_stage) == 0:
@@ -233,7 +233,7 @@ def _eval_fallback(ind, sts, nps, lens, ac, ad, bxy, pop,
     px = np.empty(n); py = np.empty(n)
     for m in range(tlim):
         dc = m * 60 * spd
-        si = 0 if m<15 else (1 if m<25 else (2 if m<35 else 3))
+        si = 0 if m<15 else (1 if m<30 else 2)
         for i in range(n):
             d = lens[i]
             if dc >= d:
