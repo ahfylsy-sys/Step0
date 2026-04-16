@@ -1,5 +1,0 @@
-Pearson Correlation: Onset-of-Release vs GE-Declaration
-N = 10 categories
-r = 0.955895
-p = 1.5695e-05
-Strength: Strong
